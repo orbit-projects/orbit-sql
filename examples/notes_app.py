@@ -21,10 +21,11 @@ from orbit import Application, ApplicationConfig, Service, ServiceDescriptor
 from orbit.asgi import Request, Response
 from orbit.runtime import Runtime
 from orbit_data import Repository
+from orbit_sql_sqlite import SQLiteConfig
+from orbit_sql_sqlite.plugin import SQLitePlugin
 from pydantic import BaseModel, ConfigDict
 
-from orbit_sql import SQLRepository, SQL_DATABASE_KEY
-from orbit_sql_sqlite import SQLiteConfig, SQLitePlugin
+from orbit_sql import SQL_DATABASE_KEY, SQLRepository
 
 
 class Note(BaseModel):

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -32,6 +33,8 @@ from orbit_sql.contracts import (
     SQLDatabase,
     SQLExecution,
     SQLParameters,
+    SQLReadPreference,
+    SQLReadRouting,
     SQLRow,
     SQLTransaction,
     SQLValue,
@@ -78,10 +81,15 @@ class SQLRepository(Repository[EntityT, SQLValue], Generic[EntityT]):
         table: str,
         primary_key: str,
         columns: Mapping[str, str] | None = None,
+        read_preference: SQLReadPreference = SQLReadPreference.PRIMARY,
     ) -> None:
-        """Bind a typed model to a table with an explicit primary-key field."""
+        """Bind a typed model and optionally route only reads to weighted provider replicas."""
         if not isinstance(executor, _SQLExecutor):
             raise TypeError("executor must implement the Orbit SQL execution contract.")
+        if not isinstance(read_preference, SQLReadPreference):
+            raise ValueError("read_preference must be a SQLReadPreference value.")
+        if read_preference is SQLReadPreference.REPLICA and not _supports_read_routing(executor):
+            raise TypeError("Replica reads require an SQLDatabase that implements SQLReadRouting.")
         if not isinstance(model, type) or not issubclass(model, BaseModel):
             raise TypeError("model must be a Pydantic BaseModel class.")
         _validate_identifier(table, "table")
@@ -108,6 +116,7 @@ class SQLRepository(Repository[EntityT, SQLValue], Generic[EntityT]):
         self._primary_key = primary_key
         self._columns = column_map
         self._field_names = field_names
+        self._read_preference = read_preference
 
     @property
     def model(self) -> type[EntityT]:
@@ -121,7 +130,7 @@ class SQLRepository(Repository[EntityT, SQLValue], Generic[EntityT]):
             f"SELECT {self._select_columns()} FROM {_quote(self._table)} "
             f"WHERE {_quote(self._columns[self._primary_key])} = $1"
         )
-        row = await self._executor.fetch_one(statement, (key,))
+        row = await self._fetch_one(statement, (key,))
         return None if row is None else self._decode(row)
 
     async def list(self, *, limit: int = 100) -> tuple[EntityT, ...]:
@@ -131,7 +140,7 @@ class SQLRepository(Repository[EntityT, SQLValue], Generic[EntityT]):
             f"SELECT {self._select_columns()} FROM {_quote(self._table)} "
             f"ORDER BY {_quote(self._columns[self._primary_key])} LIMIT $1"
         )
-        rows = await self._executor.fetch_all(statement, (limit,), limit=limit)
+        rows = await self._fetch_all(statement, (limit,), limit=limit)
         return tuple(self._decode(row) for row in rows)
 
     async def add(self, entity: EntityT) -> None:
@@ -190,6 +199,39 @@ class SQLRepository(Repository[EntityT, SQLValue], Generic[EntityT]):
             f"{_quote(self._columns[field])} AS {_quote(field)}" for field in self._field_names
         )
 
+    async def _fetch_one(self, statement: str, parameters: SQLParameters) -> SQLRow | None:
+        """Read with the fixed preference without changing mutation routing."""
+        if self._read_preference is SQLReadPreference.PRIMARY:
+            return await self._executor.fetch_one(statement, parameters)
+        executor = self._executor
+        if not isinstance(executor, SQLReadRouting):
+            raise DatabaseError(
+                "database.replica-routing-unavailable",
+                "The SQL executor does not support read-replica routing.",
+            )
+        return await executor.fetch_one(
+            statement, parameters, read_preference=self._read_preference
+        )
+
+    async def _fetch_all(
+        self, statement: str, parameters: SQLParameters, *, limit: int
+    ) -> tuple[SQLRow, ...]:
+        """Read a bounded page from the primary or an adapter-selected weighted replica."""
+        if self._read_preference is SQLReadPreference.PRIMARY:
+            return await self._executor.fetch_all(statement, parameters, limit=limit)
+        executor = self._executor
+        if not isinstance(executor, SQLReadRouting):
+            raise DatabaseError(
+                "database.replica-routing-unavailable",
+                "The SQL executor does not support read-replica routing.",
+            )
+        return await executor.fetch_all(
+            statement,
+            parameters,
+            limit=limit,
+            read_preference=self._read_preference,
+        )
+
     def _entity_values(self, entity: EntityT) -> SQLParameters:
         """Extract model values and reject nested or nonportable driver values."""
         if not isinstance(entity, self._model):
@@ -216,6 +258,7 @@ class SQLRepository(Repository[EntityT, SQLValue], Generic[EntityT]):
             table=self._table,
             primary_key=self._primary_key,
             columns=self._columns,
+            read_preference=self._read_preference,
         )
 
 
@@ -235,6 +278,10 @@ class SQLUnitOfWork(UnitOfWork):
         detached = tuple(repositories)
         if not detached or any(not isinstance(repo, SQLRepository) for repo in detached):
             raise ValueError("At least one SQLRepository is required.")
+        if any(repo._read_preference is SQLReadPreference.REPLICA for repo in detached):
+            raise ValueError(
+                "SQLUnitOfWork repositories must read from the primary for transaction consistency."
+            )
         if len({repo.model for repo in detached}) != len(detached):
             raise ValueError("Only one repository per model can be registered in a unit of work.")
         if any(repo._executor is not database for repo in detached):
@@ -294,6 +341,26 @@ def _validate_identifier(value: object, kind: str) -> None:
         raise ValueError(
             f"SQL {kind} must be a portable ASCII identifier of at most 63 characters."
         )
+
+
+def _supports_read_routing(value: object) -> bool:
+    """Verify the optional preference keywords, which runtime Protocol checks cannot inspect."""
+    if not isinstance(value, SQLDatabase) or not isinstance(value, SQLReadRouting):
+        return False
+    for method_name in ("fetch_one", "fetch_all", "transaction"):
+        try:
+            parameters = inspect.signature(getattr(value, method_name)).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        if not any(
+            parameter.name == "read_preference"
+            and parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            return False
+    return True
 
 
 def _quote(value: str) -> str:

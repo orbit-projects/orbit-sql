@@ -18,6 +18,19 @@ fixed table/column mappings and Pydantic entities; identifiers are validated and
 runtime values are always bound parameters. `SQLUnitOfWork` scopes repositories to one provider
 transaction and commits on normal exit or rolls back on exceptions and cancellation.
 
+Successful standalone writes commit before `SQLDatabase.execute()` returns. Group multiple
+statements in `database.transaction()` or `SQLUnitOfWork` to get atomic commit/rollback behavior.
+If cancellation or connection failure occurs while the database is committing, the outcome may be
+unknown; only retry writes that are idempotent or protected by an application-level deduplication
+key.
+
+Provider-neutral read routing is an optional `SQLReadRouting` extension. `SQLDatabase` remains
+primary-consistent by default. A caller can configure `SQLRepository` to route its reads to
+weighted replicas with `SQLReadPreference.REPLICA`; writes and `SQLUnitOfWork` stay on the primary.
+The provider enforces read-only transaction semantics and reports missing replicas instead of
+silently falling back. Orbit does not classify arbitrary SQL text to decide where a statement is
+safe.
+
 Providers may register a lazy resource at `SQL_DATABASE_KEY` through Core's container lifecycle.
 The registry selects trusted adapter objects explicitly and never scans entry points or imports
 packages automatically. No migrations, ORM, schema discovery, or generated identifiers are implied.
@@ -44,7 +57,15 @@ Representative implementation files in this checkout:
 
 ## Public contract and scope
 
-The README does not contain a separately headed architecture section. Its responsibility statement above and the public source files define the implemented scope; this guide adds no behavior beyond that description.
+`SQLDatabase` supplies parameterized `execute`, `fetch_one`, `fetch_all`, transaction, and close
+operations. Results are detached immutable `SQLRow` values. Successful standalone writes commit
+before `execute()` returns; explicit transaction contexts group statements atomically. `fetch_all`
+must reject results beyond the caller's bound rather than returning a partial result.
+
+This package does not parse arbitrary SQL, discover schemas, retry statements, provide an ORM, or
+run migrations. Safe parameter binding protects values; callers must keep dynamic identifiers
+fixed or validate them against an allowlist. See the separate provider package for driver-specific
+timeout, pooling, TLS, and failure behavior.
 
 ## Boundary rules
 

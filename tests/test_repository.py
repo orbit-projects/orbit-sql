@@ -20,7 +20,14 @@ from orbit_data import RepositoryConflictError
 from orbit_sql_sqlite import SQLiteDatabase
 from pydantic import BaseModel, ConfigDict
 
-from orbit_sql import DatabaseError, SQLRepository, SQLUnitOfWork
+from orbit_sql import (
+    DatabaseError,
+    SQLExecution,
+    SQLReadPreference,
+    SQLRepository,
+    SQLRow,
+    SQLUnitOfWork,
+)
 
 
 class Note(BaseModel):
@@ -30,6 +37,49 @@ class Note(BaseModel):
 
     id: int
     title: str
+
+
+class ReplicaAwareDatabase:
+    """Provider-neutral fake exposing the optional SQL read-routing extension."""
+
+    def __init__(self) -> None:
+        self.preferences: list[SQLReadPreference] = []
+        self.executions = 0
+
+    async def execute(self, statement, parameters=()):
+        """Record mutations without accepting a replica preference."""
+        del statement, parameters
+        self.executions += 1
+        return SQLExecution(rowcount=1)
+
+    async def fetch_one(
+        self, statement, parameters=(), *, read_preference=SQLReadPreference.PRIMARY
+    ):
+        """Record one selected read pool and return a detached row."""
+        del statement, parameters
+        self.preferences.append(read_preference)
+        return SQLRow(("id", "title"), (1, "replica"))
+
+    async def fetch_all(
+        self,
+        statement,
+        parameters=(),
+        *,
+        limit=1_000,
+        read_preference=SQLReadPreference.PRIMARY,
+    ):
+        """Record a bounded selected read pool and return one detached row."""
+        del statement, parameters, limit
+        self.preferences.append(read_preference)
+        return (SQLRow(("id", "title"), (1, "replica")),)
+
+    def transaction(self, *, read_preference=SQLReadPreference.PRIMARY):
+        """Expose the optional extension shape; repository reads do not open transactions."""
+        del read_preference
+        raise NotImplementedError
+
+    async def aclose(self):
+        """Implement the database lifecycle contract for structural validation."""
 
 
 async def make_database(path: str = ":memory:") -> SQLiteDatabase:
@@ -52,6 +102,43 @@ async def test_repository_crud_uses_validated_models_and_bound_values() -> None:
         assert await repository.get(1) == Note(id=1, title="changed")
         assert await repository.delete(1) is True
         assert await repository.delete(1) is False
+    finally:
+        await database.aclose()
+
+
+async def test_repository_routes_reads_to_replicas_but_keeps_mutations_on_primary() -> None:
+    """Replica preference is explicit for reads and never reroutes repository writes."""
+    database = ReplicaAwareDatabase()
+    repository = SQLRepository(
+        database,
+        Note,
+        table="notes",
+        primary_key="id",
+        read_preference=SQLReadPreference.REPLICA,
+    )
+
+    assert await repository.get(1) == Note(id=1, title="replica")
+    assert await repository.list() == (Note(id=1, title="replica"),)
+    await repository.add(Note(id=2, title="primary write"))
+
+    assert database.preferences == [SQLReadPreference.REPLICA, SQLReadPreference.REPLICA]
+    assert database.executions == 1
+    with pytest.raises(ValueError, match="must read from the primary"):
+        SQLUnitOfWork(database, (repository,))
+
+
+async def test_repository_rejects_replica_preference_for_sqlite() -> None:
+    """Providers without the explicit replica contract fail during configuration."""
+    database = SQLiteDatabase(":memory:")
+    try:
+        with pytest.raises(TypeError, match="implements SQLReadRouting"):
+            SQLRepository(
+                database,
+                Note,
+                table="notes",
+                primary_key="id",
+                read_preference=SQLReadPreference.REPLICA,
+            )
     finally:
         await database.aclose()
 

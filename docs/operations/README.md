@@ -1,37 +1,67 @@
-# Orbit SQL: operations and security
+# Orbit SQL: operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
-
-## Configuration surface
-
-Environment names found in the package README:
-
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
-
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
-
-## Lifecycle, failure behavior, and limits
-
-`orbit-sql` defines Orbit's provider-neutral SQL contract and implements SQL repositories and
-transaction-scoped units of work. It does not include a database driver. SQLite, MySQL and
-PostgreSQL implementations are installed from `orbit-sql-sqlite`, `orbit-sql-mysql` and
-`orbit-sql-postgres` respectively.
+`orbit-sql` defines a common async API; a database driver is installed separately. Select the
+provider package explicitly for the deployment, for example:
 
 ```bash
-pip install orbit-core orbit-data orbit-sql orbit-sql-sqlite
+python -m pip install orbit-core orbit-data orbit-sql orbit-sql-sqlite
 ```
 
-Applications use the same async `SQLDatabase`, bounded `SQLRow`, execution metadata and
-`SQLTransaction` types for each provider. Queries use positional `$1`, `$2`, … placeholders. Provider
-adapters bind those values safely using their native driver conventions. `SQLRepository` accepts
-fixed table/column mappings and Pydantic entities; identifiers are validated and quoted, while
-runtime values are always bound parameters. `SQLUnitOfWork` scopes repositories to one provider
-transaction and commits on normal exit or rolls back on exceptions and cancellation.
+Use `orbit-sql-mysql` or `orbit-sql-postgres` when the application needs those server databases.
+Provider-specific credentials, TLS settings, timeouts, pooling, and live-service requirements are
+documented by each adapter package.
 
-Providers may register a lazy resource at `SQL_DATABASE_KEY` through Core's container lifecycle.
-The registry selects trusted adapter objects explicitly and never scans entry points or imports
-packages automatically. No migrations, ORM, schema discovery, or generated identifiers are implied.
+## Compose repositories and transactions
 
-## Production validation
+Bind runtime values with positional `$1`, `$2`, … parameters. Place table and column names in
+trusted application configuration; placeholders do not bind identifiers. `SQLRepository` validates
+configured identifiers and binds entity values. `SQLUnitOfWork` groups repository operations in a
+single database transaction.
 
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+Successful direct writes commit before `SQLDatabase.execute()` returns. Use
+`async with database.transaction()` or `SQLUnitOfWork` for multi-statement atomic work. On normal
+exit the transaction commits; on an exception or cancellation the adapter rolls it back according
+to the provider's cleanup semantics. If cancellation or connection failure occurs during commit,
+the final write outcome can be unknown. Reconcile before retrying a non-idempotent operation and
+use an application-level deduplication key when retries can repeat effects.
+
+`fetch_all()` is bounded and rejects excess rows instead of returning a partial result. Select a
+limit that fits the endpoint's memory and latency budget; use database-side filtering and pagination
+for larger datasets. `SQLRow` is detached from driver cursors, but row values can still contain
+sensitive application data.
+
+## Read-replica routing
+
+Reads use the primary by default. To route one repository's `get()` and `list()` calls to weighted
+replicas, configure it with `read_preference=SQLReadPreference.REPLICA`. The provider must enforce
+read-only behavior and raises a provider-neutral error if replicas are not configured; it never
+silently sends a requested replica read to the primary. Repository inserts, updates, and deletes
+continue to use the primary. Replica reads can lag writes, so use the default primary preference
+for read-your-writes paths. `SQLUnitOfWork` requires primary-configured repositories because its
+transaction remains pinned to the primary.
+
+## Resource lifecycle
+
+Provider adapters can register `SQL_DATABASE_KEY` through Core's resource container. Prefer that
+managed plugin path when using Core so shutdown closes the database resource. For manual adapter
+registration, explicitly await `aclose()` in a `finally` block or use the adapter's supported
+context manager. Do not share a database instance across event loops unless its provider explicitly
+documents that behavior.
+
+The registry accepts explicitly registered adapter objects; it does not search Python entry
+points or import packages automatically. This keeps optional drivers out of applications that do
+not install them.
+
+## Failure and security handling
+
+Adapters map driver failures to `DatabaseError` codes with provider-neutral messages. Do not log
+raw SQL parameters or returned personal data. Bind values rather than interpolating them into SQL;
+validate any dynamic identifier against a fixed allowlist. Provider credentials, transport TLS,
+database permissions, and encryption at rest remain provider and deployment responsibilities.
+
+## Validation boundary
+
+The `orbit-sql` suite validates repository behavior and in-process compositions. It does not prove
+database durability, backup/restore, failover, TLS, server permission configuration, or version
+compatibility. Run each provider's documented tests against disposable services before release and
+keep production data out of tests.

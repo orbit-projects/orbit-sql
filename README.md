@@ -16,6 +16,20 @@ fixed table/column mappings and Pydantic entities; identifiers are validated and
 runtime values are always bound parameters. `SQLUnitOfWork` scopes repositories to one provider
 transaction and commits on normal exit or rolls back on exceptions and cancellation.
 
+Successful writes executed directly on `SQLDatabase` are committed before the call returns. Use
+`database.transaction()` or `SQLUnitOfWork` when several statements must succeed or roll back as
+one unit. A failure or cancellation during commit can leave the final outcome unknown; do not
+blindly retry non-idempotent writes without an application-level deduplication strategy.
+
+Read routing is primary by default. Providers that implement `SQLReadRouting` may expose weighted
+replicas. Select them for a repository's `get()` and `list()` calls with
+`SQLRepository(..., read_preference=SQLReadPreference.REPLICA)`; provider-level `fetch_one()`,
+`fetch_all()`, and `transaction()` also accept the preference directly. Repository mutations
+always use the primary. Replica requests must be server-enforced read-only and fail when no replica
+is configured. The generic contract does not parse SQL or infer query safety. Primary reads remain
+the default for read-your-writes behavior, and `SQLUnitOfWork` rejects replica-configured
+repositories to keep transactional reads and writes on the primary.
+
 Providers may register a lazy resource at `SQL_DATABASE_KEY` through Core's container lifecycle.
 The registry selects trusted adapter objects explicitly and never scans entry points or imports
 packages automatically. No migrations, ORM, schema discovery, or generated identifiers are implied.
@@ -34,7 +48,7 @@ ruff check .
 mypy
 ```
 
-This package is pre-alpha and its API is not stable. Unit tests use the separate SQLite adapter;
+This package is in alpha and its API is not stable. Unit tests use the separate SQLite adapter;
 provider wire behavior and deployment characteristics need validation against live MySQL and
 PostgreSQL services. It supports Python 3.11 through 3.14.
 

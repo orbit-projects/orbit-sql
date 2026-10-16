@@ -21,6 +21,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
+from enum import StrEnum
 from typing import Protocol, TypeAlias, runtime_checkable
 from uuid import UUID
 
@@ -31,6 +32,18 @@ SQLValue: TypeAlias = (
 
 SQLParameters: TypeAlias = tuple[SQLValue, ...]
 """Positional bound values; cross-adapter queries use PostgreSQL-style ``$1`` placeholders."""
+
+
+class SQLReadPreference(StrEnum):
+    """Explicit connection preference for read operations on providers with replicas.
+
+    ``PRIMARY`` is the default and provides read-your-writes behavior. ``REPLICA`` is an
+    explicit opt-in; providers must enforce read-only transaction semantics and fail when
+    no replica is configured instead of silently changing consistency behavior.
+    """
+
+    PRIMARY = "primary"
+    REPLICA = "replica"
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +142,11 @@ class SQLDatabase(Protocol):
     """Common asynchronous SQL capability implemented by provider adapters."""
 
     async def execute(self, statement: str, parameters: SQLParameters = ()) -> SQLExecution:
-        """Execute a parameterized statement and return affected-row metadata."""
+        """Execute a parameterized statement and return affected-row metadata.
+
+        A successful write executed outside :meth:`transaction` is committed before this call
+        returns. Use an explicit transaction context to group multiple statements atomically.
+        """
 
     async def fetch_one(self, statement: str, parameters: SQLParameters = ()) -> SQLRow | None:
         """Return one detached row, or ``None`` when there is no result."""
@@ -146,4 +163,47 @@ class SQLDatabase(Protocol):
         """Close the database and release all owned resources."""
 
 
-__all__ = ["SQLDatabase", "SQLExecution", "SQLParameters", "SQLRow", "SQLTransaction", "SQLValue"]
+@runtime_checkable
+class SQLReadRouting(Protocol):
+    """Optional provider-neutral extension for explicit, read-only replica routing.
+
+    Providers without read replicas need not implement this extension. Applications can
+    check for it structurally before requesting replica reads; ordinary ``SQLDatabase``
+    methods always retain primary consistency.
+    """
+
+    async def fetch_one(
+        self,
+        statement: str,
+        parameters: SQLParameters = (),
+        *,
+        read_preference: SQLReadPreference = SQLReadPreference.PRIMARY,
+    ) -> SQLRow | None:
+        """Fetch one row using a primary or explicitly selected read-only replica."""
+
+    async def fetch_all(
+        self,
+        statement: str,
+        parameters: SQLParameters = (),
+        *,
+        limit: int = 1_000,
+        read_preference: SQLReadPreference = SQLReadPreference.PRIMARY,
+    ) -> tuple[SQLRow, ...]:
+        """Fetch bounded rows using a primary or explicitly selected read-only replica."""
+
+    def transaction(
+        self, *, read_preference: SQLReadPreference = SQLReadPreference.PRIMARY
+    ) -> AbstractAsyncContextManager[SQLTransaction]:
+        """Open a transaction on the selected pool; replica transactions are read-only."""
+
+
+__all__ = [
+    "SQLDatabase",
+    "SQLExecution",
+    "SQLParameters",
+    "SQLReadPreference",
+    "SQLReadRouting",
+    "SQLRow",
+    "SQLTransaction",
+    "SQLValue",
+]
